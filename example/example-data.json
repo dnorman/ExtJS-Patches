@@ -1,0 +1,14 @@
+{
+    records: [
+        {
+            id: 1,
+            string: "Test value 1",
+            complex: { A: 'Alpha', B: 'Beta', C: 'Charlie' },
+            nested: [
+                { id: 1, name: 'Color',  value: 'Blurple' },
+                { id: 2, name: 'Size',   value: 'Extra medium' },
+                { id: 3, name: 'Fabric', value: 'Kevlon'  }
+            ]
+        },
+    ]
+}
