@@ -54,7 +54,7 @@ Ext.onReady(function() {
                 },
                 width: 150
                 
-            },
+            }
             
         ],
         height: 200,
