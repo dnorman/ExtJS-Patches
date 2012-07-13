@@ -14,31 +14,11 @@ It is free for use under the MIT licence.
 Ext.ns('Ext.patch');
 Ext.patch.JsonPath = true;
 
-Ext.require(['Ext.patch.ColumnSetterGetter']);
+Ext.syncRequire(['Ext.patch.deepEquals','Ext.patch.ColumnSetterGetter']);
 
 (function(){
 
-
-
-var deepEquals = function( x, y ) {
-  if ( x === y ) return true;                               // if both x and y are null or undefined and exactly the same
-  if ( ! ( x instanceof Object ) || ! ( y instanceof Object ) ) return false; // if they are not strictly equal, they both need to be Objects
-  if ( x.constructor !== y.constructor ) return false;      // they must have the exact same prototype chain, the closest we can do is test there constructor.
-  for ( var p in x ) {
-    if ( ! x.hasOwnProperty( p ) ) continue;                // other properties were tested using x.constructor === y.constructor
-    if ( ! y.hasOwnProperty( p ) ) return false;            // allows to compare x[ p ] and y[ p ] when set to undefined
-    if ( x[ p ] === y[ p ] ) continue;                      // if they have the same strict value or identity then they are equal
-    if ( typeof( x[ p ] ) !== "object" ) return false;      // Numbers, Strings, Functions, Booleans must be strictly equal
-    if ( ! deepEquals( x[ p ],  y[ p ] ) ) return false;    // Objects and Arrays must be tested recursively
-  }
-
-  for ( p in y ) {
-    if ( y.hasOwnProperty( p ) && ! x.hasOwnProperty( p ) ) return false;  // allows x[ p ] to be set to undefined
-  }
-  return true;
-}
-
-
+var deepEquals = Ext.deepEquals;
 
 // Including JSONPath inline for simplicity
 
@@ -147,29 +127,25 @@ function jsonPath(obj, expr, arg) {
 //
 
 
+
+var filter = /[$\[\]\:\.]/;
 var walk = function( val, path ){
     if ( typeof val != 'object' ) return null;
     if (path.length == 0) return val;
     return walk( val[ path[0] ], path.slice(1) ); // shouuuld work for both Array & Object
 }
 
-
-var filter = /[$\[\]\:\.]/;
-
-// This override adds dataPath config key to Ext.grid.column.Column
-// as well as automatic detection / conversion of dataIndex to dataPath
-
 Ext.override(Ext.grid.column.Column, {
     initComponent: function() {
         var me = this;
         
-        if (me.dataIndex && filter.test(me.dataIndex) ){
+        if ((!me.dataPath) && me.dataIndex && filter.test(me.dataIndex) ){
             me.dataPath = me.dataIndex;
-            //delete me.dataIndex;
         }
         
         if(me.dataPath){ // THIS PART IS OPTIONAL. COULD JUST LET THE USER DO A CUSTOM SETTER/GETTER
-            
+            var parts = me.dataPath.split(/\./);
+            var rootKey = parts[0];
             if(!me.getter) me.getter = function(record){
                 return record.getByPath( me.dataPath );
             }
@@ -177,16 +153,15 @@ Ext.override(Ext.grid.column.Column, {
                 record.setByPath( me.dataPath, value );
             }
             if(!me.checkModified) me.checkModified = function(record, value){
-                return false;
+                return record.modified[ rootKey ] ? true : false;
             }
+            me.dataIndex = me.dataPath;
         }
         
         me.callOverridden(arguments);
     }
 });
 
-
-// Custom additions to Ext.data.Model
 Ext.override(Ext.data.Model,{
     getByPath: function(pathStr){
         var rv = jsonPath( this[this.persistenceProperty], pathStr );
@@ -201,6 +176,7 @@ Ext.override(Ext.data.Model,{
         var paths = jsonPath( data , pathStr , { resultType: 'LIST', autoVivify: true } );
         if(!paths) return false;
         
+        var modFields = [pathStr];
         // pathStr could match multiple paths, have to do the set for each one
         Ext.each(paths, function(path){
             if (path.length == 0) return;
@@ -216,10 +192,11 @@ Ext.override(Ext.data.Model,{
             var currentVal = endRef[endKey];
             
             if (field && field.persist && !me.isEqual( currentVal , setVal )){
+                if( modFields.indexOf(field.name) == -1 ) modFields.push( field.name );
                 if( modified[ rootKey ] ){
                     endRef[endKey] = setVal; // already modified. set prior to the deepEquals
                     if( deepEquals( modified[ rootKey ], rootRef ) ){
-                        delete modified[fieldName];
+                        delete modified[rootKey];
                         me.dirty = false;
                         
                         for (key in modified) {
@@ -237,19 +214,15 @@ Ext.override(Ext.data.Model,{
             }else{
                 endRef[endKey] = setVal;
             }
-
             
             if (!me.editing) {
-                me.afterEdit();
+                me.afterEdit(modFields);
             }
         });
         
         return true;
     }
 });
-//
-
-
 
 
 

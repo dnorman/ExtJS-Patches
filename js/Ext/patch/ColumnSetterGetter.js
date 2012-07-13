@@ -19,6 +19,8 @@ It is free for use under the MIT licence.
 Ext.ns('Ext.patch');
 Ext.patch.ColumnSetterGetter = true;
 
+Ext.syncRequire(['Ext.patch.deepEquals']);
+
 // THIS CODE SHIFTS THE GET/SET RESPONSIBILITY ONTO THE COLUMN OBJECT
 Ext.override(Ext.grid.column.Column, {
     initComponent: function() {
@@ -26,36 +28,51 @@ Ext.override(Ext.grid.column.Column, {
         
         me.callOverridden(arguments);
         
-        if( me.dataIndex ){
-            
-            if(!me.getter) me.getter = function(record){
-                return record.get( me.dataIndex );
-            }
-            if(!me.setter) me.setter = function(record, value){
-                record.set( me.dataIndex, value );
-            }
-            if(!me.checkModified) me.checkModified = function(record, value){
-                return record.isModified( me.dataIndex );
-            }
-            
-        }
+        // TODO - populate a phony dataIndex for naked setter/getter pairs, so shouldUpdateCell has something to go on.
+        // ALSO - column.hasCustomRenderer is potentially an unnecessary performance hit in some situations
+        // TODO - split by slash to populate displayIndex
+        
+        if( me.dataIndex ) Ext.applyIf(me,{
+                getter:        function(r){     return r.get( me.dataIndex        ) },
+                setter:        function(r, v){  return r.set( me.dataIndex, v     ) },
+                checkModified: function(r){     return r.isModified( me.dataIndex ) }
+            });
+        if ( me.displayIndex ) Ext.applyIf(me,{
+                displayGetter: function(r)  { return r.get( me.displayIndex    ) },
+                displaySetter: function(r,v){ return r.set( me.displayIndex, v ) }
+            });
         
         Ext.applyIf(me, {
-            getter: Ext.emptyFn,
-            setter: Ext.emptyFn,
+            getter: Ext.emptyFn, displayGetter: me.getter || Ext.emptyFn,
+            setter: Ext.emptyFn, displaySetter: me.setter || Ext.emptyFn,
             checkModified: Ext.emptyFn
         });
         
     }
 });
 
+Ext.override(Ext.view.Table, {
+    shouldUpdateCell: function(column, changedFieldNames){
+       
+        if( typeof column.shouldUpdate == 'function' ){        // ADDED
+            return column.shouldUpdate( changedFieldNames );   // ADDED
+        }else if (column.hasCustomRenderer) {                  // MODIFIED
+            return true;
+        }
+        return !changedFieldNames || Ext.Array.contains(changedFieldNames, column.dataIndex);
+   }
+});
 
-// BELOW THIS LINE - MINOR TWEAKS ONLY. CHANGES TO 4.0.7 ARE ANNOTATED
+Ext.override(Ext.data.Model, {
+    isEqual: Ext.deepEquals
+});
+// BELOW THIS LINE - MINOR TWEAKS ONLY. CHANGES TO 4.1rc1 ARE ANNOTATED
 
 Ext.override(Ext.grid.header.Container,{
     prepareData: function(data, rowIdx, record, view, panel) {
-        var obj       = {},
-            headers   = this.gridDataColumns || this.getGridColumns(),
+        var me        = this,
+            obj       = {},
+            headers   = me.gridDataColumns || me.getGridColumns(),
             headersLn = headers.length,
             colIdx    = 0,
             header,
@@ -73,20 +90,13 @@ Ext.override(Ext.grid.header.Container,{
             header = headers[colIdx];
             headerId = header.id;
             renderer = header.renderer;
-            
             // MODIFICATION  -  MODIFICATION  -  MODIFICATION  -  MODIFICATION
-            value    = header.getter(record);
+            value    = header.displayGetter(record);
             // END END END END END END END END END END END END END END END END 
 
-            // When specifying a renderer as a string, it always resolves
-            // to Ext.util.Format
-            if (typeof renderer === "string") {
-                header.renderer = renderer = Ext.util.Format[renderer];
-            }
-
-            if (typeof renderer === "function") {
+            if (typeof renderer == "function") {
                 value = renderer.call(
-                    header.scope || this.ownerCt,
+                    header.scope || me.ownerCt,
                     value,
                     // metadata per cell passing an obj by reference so that
                     // it can be manipulated inside the renderer
@@ -101,99 +111,156 @@ Ext.override(Ext.grid.header.Container,{
 
             // <debug>
             if (metaData.css) {
-                // This warning attribute is used by the compat layer
+                // This warning attribute is used by the compat layers
                 obj.cssWarning = true;
                 metaData.tdCls = metaData.css;
                 delete metaData.css;
             }
             // </debug>
+            if (me.markDirty) {
+                // MODIFICATION  -  MODIFICATION  -  MODIFICATION  -  MODIFICATION
+                obj[headerId + '-modified'] = header.checkModified( record )     ? Ext.baseCSSPrefix + 'grid-dirty-cell' : '';
+                // END END END END END END END END END END END END END END END END
+            }
             
-            // MODIFICATION  -  MODIFICATION  -  MODIFICATION  -  MODIFICATION
-            obj[headerId+'-modified'] = header.checkModified( record ) ? Ext.baseCSSPrefix + 'grid-dirty-cell' : '';
-            // END END END END END END END END END END END END END END END END 
+            
             
             obj[headerId+'-tdCls'] = metaData.tdCls;
             obj[headerId+'-tdAttr'] = metaData.tdAttr;
             obj[headerId+'-style'] = metaData.style;
-            if (value === undefined || value === null || value === '') {
-                value = '&#160;';
+            if (typeof value === 'undefined' || value === null || value === '') {
+                value = header.emptyCellText;
             }
             obj[headerId] = value;
         }
         return obj;
-    },
+    }
 });
 
 Ext.override(Ext.grid.plugin.Editing,{
     getEditingContext: function(record, columnHeader) {
         var me = this,
             grid = me.grid,
-            store = grid.store,
-            rowIdx,
-            colIdx,
             view = grid.getView(),
-            value;
+            node = view.getNode(record),
+            rowIdx, colIdx;
 
-        // If they'd passed numeric row, column indices, look them up.
+        if(!node) return; // MODIFICATION - action column calls startEdit for some stupid reason, but the node is gone because it was a delete button
+        
+        // An intervening listener may have deleted the Record
+        if (!node) {
+            return;
+        }
+
+        // Coerce the column index to the closest visible column
+        columnHeader = grid.headerCt.getVisibleHeaderClosestToIndex(Ext.isNumber(columnHeader) ? columnHeader : columnHeader.getIndex());
+
+        // No corresponding column. Possible if all columns have been moved to the other side of a lockable grid pair
+        if (!columnHeader) {
+            return;
+        }
+
+        colIdx = columnHeader.getIndex();
+
         if (Ext.isNumber(record)) {
+            // look up record if numeric row index was passed
             rowIdx = record;
-            record = store.getAt(rowIdx);
+            record = view.getRecord(node);
         } else {
-            rowIdx = store.indexOf(record);
+            rowIdx = view.indexOf(node);
         }
-        if (Ext.isNumber(columnHeader)) {
-            colIdx = columnHeader;
-            columnHeader = grid.headerCt.getHeaderAtIndex(colIdx);
-        } else {
-            colIdx = columnHeader.getIndex();
-        }
-
-        // MODIFICATION  -  MODIFICATION  -  MODIFICATION  -  MODIFICATION
-        value = columnHeader.getter( record );
-        // END END END END END END END END END END END END END END END END 
 
         return {
-            grid: grid,
-            record: record,
-            field: columnHeader.dataIndex,
-            value: value,
-            row: view.getNode(rowIdx),
-            column: columnHeader,
-            rowIdx: rowIdx,
-            colIdx: colIdx
+            grid   : grid,
+            record : record,
+            field  : columnHeader.dataIndex,
+            value  : columnHeader.displayGetter( record ), // MODIFICATION
+            row    : view.getNode(rowIdx),
+            column : columnHeader,
+            rowIdx : rowIdx,
+            colIdx : colIdx
         };
-    },
+    }
 });
 
+
+Ext.override(Ext.Editor,{
+    startEdit : function(el, value, displayValue) {
+        var me = this,
+            field = me.field;
+
+        me.completeEdit();
+        me.boundEl = Ext.get(el);
+        value = Ext.isDefined(value) ? value : Ext.String.trim(me.boundEl.dom.innerText || me.boundEl.dom.innerHTML);
+
+        if (!me.rendered) {
+            me.render(me.parentEl || document.body);
+        }
+
+        if (me.fireEvent('beforestartedit', me, me.boundEl, value) !== false) {
+            me.startValue = value;
+            me.show();
+            // temporarily suspend events on field to prevent the "change" event from firing when reset() and setValue() are called
+            field.suspendEvents();
+            field.reset();
+            // HACK HACK HACK
+            if( field.setValueText  ){
+                field.setValueText( value, displayValue );
+            }else{
+                field.setValue(value);
+            }
+            // END HACK
+            field.resumeEvents();
+            me.realign(true);
+            field.focus(false, 10);
+            if (field.autoSize) {
+                field.autoSize();
+            }
+            me.editing = true;
+        }
+    }
+});
 Ext.override(Ext.grid.plugin.CellEditing,{
     startEdit: function(record, columnHeader) {
         var me = this,
-        
-            // MODIFICATION  -  MODIFICATION  -  MODIFICATION  -  MODIFICATION
-            value = columnHeader.getter(record),
-            // END END END END END END END END END END END END END END END END 
-            
             context = me.getEditingContext(record, columnHeader),
-            ed;
+            value, ed;
+
+        // Complete the edit now, before getting the editor's target
+        // cell DOM element. Completing the edit causes a row refresh.
+        // Also allows any post-edit events to take effect before continuing
+        me.completeEdit();
+        
+        // Cancel editing if EditingContext could not be found (possibly because record has been deleted by an intervening listener), or if the grid view is not currently visible
+        if (!context || !me.grid.view.isVisible(true)) {
+            return false;
+        }
 
         record = context.record;
         columnHeader = context.column;
 
-        // Complete the edit now, before getting the editor's target
-        // cell DOM element. Completing the edit causes a view refresh.
-        me.completeEdit();
-
-        context.originalValue = context.value = value;
-        if (me.beforeEdit(context) === false || me.fireEvent('beforeedit', context) === false || context.cancel) {
-            return false;
-        }
-        
         // See if the field is editable for the requested record
         if (columnHeader && !columnHeader.getEditor(record)) {
             return false;
         }
-        
+
+        // MODIFICATION  -  MODIFICATION  -  MODIFICATION  -  MODIFICATION
+        value        = columnHeader.getter(record),
+        displayValue = columnHeader.displayGetter(record),
+        // END END END END END END END END END END END END END END END END
+        context.originalValue = context.value = value;
+        if (me.beforeEdit(context) === false || me.fireEvent('beforeedit', me, context) === false || context.cancel) {
+            return false;
+        }
+
         ed = me.getEditor(record, columnHeader);
+
+        // Whether we are going to edit or not, ensure the edit cell is scrolled into view
+        me.grid.view.cancelFocus();
+        me.view.focusCell({
+            row: context.row,
+            column: context.colIdx
+        });
         if (ed) {
             me.context = context;
             me.setActiveEditor(ed);
@@ -201,39 +268,40 @@ Ext.override(Ext.grid.plugin.CellEditing,{
             me.setActiveColumn(columnHeader);
 
             // Defer, so we have some time between view scroll to sync up the editor
-            me.editTask.delay(15, ed.startEdit, ed, [me.getCell(record, columnHeader), value]);
-        } else {
-            // BrowserBug: WebKit & IE refuse to focus the element, rather
-            // it will focus it and then immediately focus the body. This
-            // temporary hack works for Webkit and IE6. IE7 and 8 are still
-            // broken
-            me.grid.getView().getEl(columnHeader).focus((Ext.isWebKit || Ext.isIE) ? 10 : false);
+            me.editTask.delay(15, ed.startEdit, ed, [me.getCell(record, columnHeader), value, displayValue ]); // MODIFICATION
+            me.editing = true;
+            me.scroll = me.view.el.getScroll();
+            return true;
         }
+        return false;
     },
     onEditComplete : function(ed, value, startValue) {
         var me = this,
             grid = me.grid,
-            sm = grid.getSelectionModel(),
-            activeColumn = me.getActiveColumn();
-            //dataIndex; // REMOVED
+            activeColumn = me.getActiveColumn(),
+            record;
 
         if (activeColumn) {
-            //dataIndex = activeColumn.dataIndex; // REMOVED
+            record = me.context.record;
 
             me.setActiveEditor(null);
             me.setActiveColumn(null);
             me.setActiveRecord(null);
-            delete sm.wasEditing;
     
             if (!me.validateEdit()) {
                 return;
             }
             // Only update the record if the new value is different than the
-            // startValue, when the view refreshes its el will gain focus
-            if (value !== startValue) {
+            // startValue. When the view refreshes its el will gain focus
+            if (!record.isEqual(value, startValue)) {
                 
                 // MODIFICATION  -  MODIFICATION  -  MODIFICATION  -  MODIFICATION
-                activeColumn.setter( me.context.record, value );
+                // HACK - given that displaySetter doesn't yet appear to trigger the view refresh, set the display first to force display update.
+                if( activeColumn.displaySetter !== activeColumn.setter ){
+                    var field = ed.field || ed.editor;
+                    activeColumn.displaySetter( me.context.record, field.getRawValue ? field.getRawValue() : value );
+                }
+                activeColumn.setter( record, value );
                 // END END END END END END END END END END END END END END END END 
                 
             // Restore focus back to the view's element.
@@ -243,5 +311,5 @@ Ext.override(Ext.grid.plugin.CellEditing,{
             me.context.value = value;
             me.fireEvent('edit', me, me.context);
         }
-    },
+    }
 });
